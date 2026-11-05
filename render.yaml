@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: keybot
+    runtime: python
+    plan: free            # persistent DB chahiye to "starter" karo + niche disk uncomment karo
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: CHANNEL_INVITE_URL
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: STORAGE_CHANNEL_ID
+        sync: false
+      # - key: DATABASE_PATH
+      #   value: /data/bot.db
+    # disk:                # sirf paid plan par
+    #   name: botdata
+    #   mountPath: /data
+    #   sizeGB: 1

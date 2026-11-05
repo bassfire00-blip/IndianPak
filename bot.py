@@ -16,6 +16,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     ChatJoinRequestHandler,
+    MessageHandler,
+    filters,
 )
 
 logging.basicConfig(
@@ -31,9 +33,12 @@ CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "-1003245718111").strip()
 CHANNEL_INVITE_URL = os.getenv("CHANNEL_INVITE_URL", "https://t.me/+IYpwhe6tiX80MzY9").strip()
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "7112911083").strip()
 STORAGE_CHANNEL_ID_RAW = os.getenv("STORAGE_CHANNEL_ID", "-1004402808732").strip()
+PRIVATE_GROUP_ID_RAW = os.getenv("PRIVATE_GROUP_ID", "").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db").strip()
 PORT = int(os.getenv("PORT", "10000"))
 COOLDOWN_SECONDS = 24 * 60 * 60
+GEMS_PER_REFERRAL = 10
+PRIVATE_GROUP_COST = 100
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN environment variable.")
@@ -46,8 +51,9 @@ try:
     CHANNEL_ID = int(CHANNEL_ID_RAW)
     ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()}
     STORAGE_CHANNEL_ID = int(STORAGE_CHANNEL_ID_RAW) if STORAGE_CHANNEL_ID_RAW else None
+    PRIVATE_GROUP_ID = int(PRIVATE_GROUP_ID_RAW) if PRIVATE_GROUP_ID_RAW else None
 except ValueError as exc:
-    raise RuntimeError("CHANNEL_ID, ADMIN_IDS and STORAGE_CHANNEL_ID must be numeric Telegram IDs.") from exc
+    raise RuntimeError("CHANNEL_ID, ADMIN_IDS, STORAGE_CHANNEL_ID and PRIVATE_GROUP_ID must be numeric Telegram IDs.") from exc
 
 db_parent = Path(DATABASE_PATH).parent
 db_parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +109,15 @@ def init_db():
             requested_at INTEGER NOT NULL
         );
         """)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        for name, ddl in (
+            ("referred_by", "INTEGER"),
+            ("ref_credited", "INTEGER DEFAULT 0"),
+            ("gems", "INTEGER DEFAULT 0"),
+            ("private_unlocked", "INTEGER DEFAULT 0"),
+        ):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
 
 
 def is_admin(user_id: int) -> bool:
@@ -194,7 +209,12 @@ async def post_stop(app: Application):
 def main_keyboard(is_member: bool = False):
     if is_member:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔑 Generate Key", callback_data="generate_key")]
+            [InlineKeyboardButton("🔑 Generate Key", callback_data="generate_key")],
+            [
+                InlineKeyboardButton("💎 My Gems", callback_data="gems"),
+                InlineKeyboardButton("👥 Refer & Earn", callback_data="refer"),
+            ],
+            [InlineKeyboardButton(f"🔓 Private Group ({PRIVATE_GROUP_COST} 💎)", callback_data="private")],
         ])
     rows = []
     if CHANNEL_INVITE_URL:
@@ -212,14 +232,69 @@ async def check_membership(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> 
         return False
 
 
+def get_gems(user_id: int) -> int:
+    with connect_db() as conn:
+        row = conn.execute("SELECT gems FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return int(row["gems"] or 0) if row else 0
+
+
+async def try_credit_referral(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Naya banda channel join verify kare to referrer ko 10 gems (sirf ek baar)."""
+    referrer = None
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT referred_by, ref_credited FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row and row["referred_by"] and not row["ref_credited"] and row["referred_by"] != user_id:
+            referrer = int(row["referred_by"])
+            conn.execute("UPDATE users SET ref_credited = 1 WHERE user_id = ?", (user_id,))
+            conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (referrer,))
+            conn.execute(
+                "UPDATE users SET gems = COALESCE(gems, 0) + ? WHERE user_id = ?",
+                (GEMS_PER_REFERRAL, referrer),
+            )
+            total = conn.execute("SELECT gems FROM users WHERE user_id = ?", (referrer,)).fetchone()["gems"]
+    if referrer:
+        mark_dirty()
+        try:
+            await context.bot.send_message(
+                referrer,
+                f"🎉 Tumhare referral se ek naya member join hua!\n"
+                f"+{GEMS_PER_REFERRAL} 💎 mile. Total gems: {total}",
+            )
+        except TelegramError:
+            pass
+
+
+async def animate_loading(query, title: str):
+    frames = ["▱▱▱▱▱  0%", "▰▱▱▱▱  20%", "▰▰▱▱▱  40%", "▰▰▰▱▱  60%", "▰▰▰▰▱  80%", "▰▰▰▰▰  100%"]
+    try:
+        for frame in frames:
+            await query.edit_message_text(f"{title}\n\n{frame}")
+            await asyncio.sleep(0.6)
+    except TelegramError:
+        pass
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not update.effective_message:
         return
     with connect_db() as conn:
-        conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (user.id,))
+        cur = conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (user.id,))
+        is_new = cur.rowcount > 0
+        if is_new and context.args and context.args[0].startswith("ref_"):
+            try:
+                ref_id = int(context.args[0][4:])
+            except ValueError:
+                ref_id = None
+            if ref_id and ref_id != user.id:
+                conn.execute("UPDATE users SET referred_by = ? WHERE user_id = ?", (ref_id, user.id))
+    if is_new:
+        mark_dirty()
     member = await check_membership(context, user.id)
     if member:
+        await try_credit_referral(context, user.id)
         await update.effective_message.reply_text(
             "✅ Verification successful!\n\nYou can generate one key every 24 hours.",
             reply_markup=main_keyboard(True),
@@ -243,39 +318,52 @@ async def verify_or_generate(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if data == "verify_join":
         if await check_membership(context, user_id):
+            await try_credit_referral(context, user_id)
             await query.edit_message_text(
                 "✅ You are verified!\n\nPress below to generate your key.",
                 reply_markup=main_keyboard(True),
             )
             return
 
-        with connect_db() as conn:
-            request = conn.execute(
-                "SELECT user_id FROM join_requests WHERE user_id = ? AND chat_id = ?",
-                (user_id, CHANNEL_ID),
-            ).fetchone()
-
-        if request:
-            try:
-                await context.bot.approve_chat_join_request(chat_id=CHANNEL_ID, user_id=user_id)
-                with connect_db() as conn:
-                    conn.execute("DELETE FROM join_requests WHERE user_id = ?", (user_id,))
-                await query.edit_message_text(
-                    "✅ Your join request was approved. Press Verify again in a moment, "
-                    "or use /start to refresh your membership.",
-                    reply_markup=main_keyboard(False),
+        # Bot khud request approve karta hai. DB record na bhi ho (restart ke baad)
+        # to bhi seedha approve try karta hai; request hogi to Telegram approve kar dega.
+        try:
+            await context.bot.approve_chat_join_request(chat_id=CHANNEL_ID, user_id=user_id)
+        except TelegramError as exc:
+            err = str(exc).lower()
+            log.warning("Approve join request failed for %s: %s", user_id, exc)
+            if "hide_requester_missing" in err or "user_already_participant" in err or "not found" in err:
+                msg = (
+                    "No pending join request found. Tap Join Private Channel, submit a join request, "
+                    "then return here and press Verify again."
                 )
-            except TelegramError as exc:
-                log.warning("Could not approve join request for %s: %s", user_id, exc)
-                await query.edit_message_text(
+            else:
+                msg = (
                     "I couldn't approve the request. Please make sure the bot is an admin "
-                    "with permission to invite users, then try again.",
-                    reply_markup=main_keyboard(False),
+                    "with permission to invite users, then try again."
                 )
+            await query.edit_message_text(msg, reply_markup=main_keyboard(False))
+            return
+
+        with connect_db() as conn:
+            conn.execute("DELETE FROM join_requests WHERE user_id = ?", (user_id,))
+
+        # Approve ke turant baad membership dobara check karke seedha menu dikhao.
+        verified = False
+        for _ in range(3):
+            if await check_membership(context, user_id):
+                verified = True
+                break
+            await asyncio.sleep(1)
+        if verified:
+            await try_credit_referral(context, user_id)
+            await query.edit_message_text(
+                "✅ Request approve ho gayi aur tum verified ho!\n\nPress below to generate your key.",
+                reply_markup=main_keyboard(True),
+            )
         else:
             await query.edit_message_text(
-                "No pending join request found. Tap Join Private Channel, submit a join request, "
-                "then return here and press Verify again.",
+                "✅ Your join request was approved. Press Verify again in a moment.",
                 reply_markup=main_keyboard(False),
             )
         return
@@ -326,6 +414,7 @@ async def verify_or_generate(update: Update, context: ContextTypes.DEFAULT_TYPE)
             key_value = available["key_value"]
         mark_dirty()
 
+        await animate_loading(query, "🔄 Generating your key...")
         # Telegram HTML mein <br> support nahi hota, isliye \n use kiya hai.
         await query.edit_message_text(
             f"🎉 Your key:\n<code>{escape(key_value)}</code>\n\n"
@@ -334,6 +423,91 @@ async def verify_or_generate(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]
             ]),
+        )
+        return
+
+    if data == "gems":
+        await query.edit_message_text(
+            f"💎 Tumhare gems: {get_gems(user_id)}\n\n"
+            f"1 referral = {GEMS_PER_REFERRAL} 💎\n"
+            f"{PRIVATE_GROUP_COST} 💎 = Private Group (saari private files) ki entry",
+            reply_markup=main_keyboard(True),
+        )
+        return
+
+    if data == "refer":
+        link = f"https://t.me/{context.bot.username}?start=ref_{user_id}"
+        await query.edit_message_text(
+            f"👥 Refer & Earn\n\n"
+            f"Ye link dosto ko bhejo. Jab wo bot start karke channel join aur verify karenge, "
+            f"tumhe {GEMS_PER_REFERRAL} 💎 milenge.\n\n"
+            f"🔗 {link}\n\n"
+            f"💎 Abhi ke gems: {get_gems(user_id)}",
+            reply_markup=main_keyboard(True),
+        )
+        return
+
+    if data == "private":
+        if not await check_membership(context, user_id):
+            await query.edit_message_text(
+                "❌ Pehle required channel join karke verify karo.",
+                reply_markup=main_keyboard(False),
+            )
+            return
+        if not PRIVATE_GROUP_ID:
+            await query.edit_message_text(
+                "⚠️ Private group abhi set nahi hua. Admin se contact karo.",
+                reply_markup=main_keyboard(True),
+            )
+            return
+        with connect_db() as conn:
+            row = conn.execute(
+                "SELECT gems, private_unlocked FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            gems = int(row["gems"] or 0) if row else 0
+            unlocked = bool(row and row["private_unlocked"])
+            charged = False
+            if not unlocked:
+                if gems < PRIVATE_GROUP_COST:
+                    need = PRIVATE_GROUP_COST - gems
+                    await query.edit_message_text(
+                        f"🔒 Private Group ke liye {PRIVATE_GROUP_COST} 💎 chahiye.\n"
+                        f"Tumhare paas {gems} 💎 hain, abhi {need} 💎 aur chahiye "
+                        f"({(need + GEMS_PER_REFERRAL - 1) // GEMS_PER_REFERRAL} referrals).",
+                        reply_markup=main_keyboard(True),
+                    )
+                    return
+                cur = conn.execute(
+                    "UPDATE users SET gems = gems - ?, private_unlocked = 1 "
+                    "WHERE user_id = ? AND gems >= ? AND COALESCE(private_unlocked, 0) = 0",
+                    (PRIVATE_GROUP_COST, user_id, PRIVATE_GROUP_COST),
+                )
+                charged = cur.rowcount > 0
+        try:
+            invite = await context.bot.create_chat_invite_link(
+                PRIVATE_GROUP_ID, member_limit=1, expire_date=int(time.time()) + 24 * 3600
+            )
+        except TelegramError as exc:
+            log.error("Private group invite failed: %s", exc)
+            if charged:
+                with connect_db() as conn:
+                    conn.execute(
+                        "UPDATE users SET gems = gems + ?, private_unlocked = 0 WHERE user_id = ?",
+                        (PRIVATE_GROUP_COST, user_id),
+                    )
+            await query.edit_message_text(
+                "⚠️ Invite link nahi ban paya. Admin se bolo ki bot ko private group mein admin "
+                "(Invite Users permission) banaye. Tumhare gems safe hain.",
+                reply_markup=main_keyboard(True),
+            )
+            return
+        mark_dirty()
+        await query.edit_message_text(
+            "🎉 Private Group unlock ho gaya!\n\n"
+            f"🔗 {invite.invite_link}\n\n"
+            "Ye link sirf 1 banda use kar sakta hai aur 24 ghante mein expire ho jayega. "
+            "Link kho jaye to ye button dobara dabao (gems dobara nahi katenge).",
+            reply_markup=main_keyboard(True),
         )
         return
 
@@ -350,26 +524,7 @@ async def verify_or_generate(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
 
 
-async def addkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    user = update.effective_user
-    if not message or not user:
-        return
-    if not is_admin(user.id):
-        await message.reply_text("⛔ This command is for bot admins only.")
-        return
-    text = None
-    if message.reply_to_message and message.reply_to_message.text:
-        text = message.reply_to_message.text
-    elif context.args:
-        text = "\n".join(context.args)
-    if not text:
-        await message.reply_text(
-            "Keys add karne ke liye:\n"
-            "1) Keys ek message mein bhejo (ek line = ek key), phir us message ko reply karke /addkeys likho.\n"
-            "2) Ya: /addkeys KEY1 KEY2 KEY3"
-        )
-        return
+def import_keys(text: str):
     values = [line.strip() for line in text.splitlines() if line.strip()]
     added = 0
     duplicates = 0
@@ -380,9 +535,62 @@ async def addkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 added += 1
             except sqlite3.IntegrityError:
                 duplicates += 1
-    mark_dirty()
+    if added:
+        mark_dirty()
+    return added, duplicates
+
+
+async def addkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not is_admin(user.id):
+        await message.reply_text("⛔ This command is for bot admins only.")
+        return
+    # Optional shortcut: /addkeys KEY1 KEY2 ...
+    if context.args:
+        added, duplicates = import_keys("\n".join(context.args))
+        await message.reply_text(
+            f"✅ Bulk import complete.\nAdded: {added}\nDuplicates skipped: {duplicates}"
+        )
+        return
+    context.user_data["awaiting_keys"] = True
     await message.reply_text(
-        f"✅ Bulk import complete.\nAdded: {added}\nDuplicates skipped: {duplicates}"
+        "📄 Ab apni KEY.txt file bhejo.\n"
+        "File ke andar ek line mein ek key honi chahiye.\n\n"
+        "Cancel karne ke liye /cancel likho."
+    )
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message and context.user_data.pop("awaiting_keys", None):
+        await message.reply_text("❎ Cancelled.")
+
+
+async def keys_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not message.document:
+        return
+    if not is_admin(user.id) or not context.user_data.get("awaiting_keys"):
+        return
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith(".txt"):
+        await message.reply_text("❌ Sirf .txt file bhejo (jaise KEY.txt).")
+        return
+    try:
+        tg_file = await doc.get_file()
+        data = await tg_file.download_as_bytearray()
+        text = bytes(data).decode("utf-8-sig", errors="ignore")
+    except TelegramError as exc:
+        await message.reply_text(f"❌ File download nahi hui: {exc}")
+        return
+    added, duplicates = import_keys(text)
+    context.user_data["awaiting_keys"] = False
+    await message.reply_text(
+        f"✅ File import complete.\nAdded: {added}\nDuplicates skipped: {duplicates}"
     )
 
 
@@ -433,7 +641,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg:
         await msg.reply_text(
             "Commands:\n/start - Open key menu\n"
-            "/addkeys - (admin) keys add karo\n/stats - (admin) statistics\n/backup - (admin) manual backup"
+            "/addkeys - (admin) KEY.txt file se keys add karo\n/stats - (admin) statistics\n/backup - (admin) manual backup"
         )
 
 
@@ -454,7 +662,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("addkeys", addkeys_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, keys_file_handler))
     app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CallbackQueryHandler(verify_or_generate))
     app.add_handler(ChatJoinRequestHandler(join_request_handler))
